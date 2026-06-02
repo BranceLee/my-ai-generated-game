@@ -390,22 +390,53 @@ extract_error_from_events() {
 # 计算时间差（秒）
 # ---------------------------------------------------------------------------
 calc_duration_seconds() {
-    local start="$1"  # ISO 8601 时间戳
-    local end="$2"    # ISO 8601 时间戳
+    local start="$1"  # 毫秒 epoch 或 ISO 8601 时间戳
+    local end="$2"    # 毫秒 epoch 或 ISO 8601 时间戳
     if [ -z "$start" ] || [ -z "$end" ]; then
         echo "0"
         return
     fi
     # 转换为 epoch 秒
     local start_epoch end_epoch
-    if [[ "$OSTYPE" == "darwin"* ]]; then
+    # 检测：如果是纯数字则为毫秒 epoch（如 1780401019860）
+    if [[ "$start" =~ ^[0-9]+$ ]]; then
+        # 毫秒 epoch → 秒
+        start_epoch=$(( start / 1000 ))
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
         start_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${start%%.*}" +%s 2>/dev/null || echo "0")
-        end_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${end%%.*}" +%s 2>/dev/null || echo "0")
     else
         start_epoch=$(date -d "${start%%.*}" +%s 2>/dev/null || echo "0")
+    fi
+
+    if [[ "$end" =~ ^[0-9]+$ ]]; then
+        end_epoch=$(( end / 1000 ))
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        end_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${end%%.*}" +%s 2>/dev/null || echo "0")
+    else
         end_epoch=$(date -d "${end%%.*}" +%s 2>/dev/null || echo "0")
     fi
     echo $(( end_epoch - start_epoch ))
+}
+
+# 将毫秒 epoch 或 ISO 8601 时间戳转换为 ISO 8601 字符串
+epoch_to_iso() {
+    local ts="$1"
+    if [ -z "$ts" ]; then
+        echo ""
+        return
+    fi
+    # 如果是纯数字（毫秒 epoch），转换为 ISO 8601
+    if [[ "$ts" =~ ^[0-9]+$ ]]; then
+        local epoch_sec=$(( ts / 1000 ))
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            date -j -f "%s" "$epoch_sec" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "$ts"
+        else
+            date -d "@$epoch_sec" -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "$ts"
+        fi
+    else
+        # 已经是 ISO 8601 字符串，直接返回
+        echo "$ts"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -423,12 +454,20 @@ output_callback_json() {
     local ready_at="$9"
     local error_msg="${10:-}"
 
-    # 转义 commit message 中的特殊字符
+    # 转义 commit message 和 error message 中的特殊字符
+    # 注意：先 trim 掉首尾空白，避免 jq 转义出 "\n" 等干扰
     if command -v jq &>/dev/null; then
+        local msg_trimmed err_trimmed
+        msg_trimmed=$(printf '%s' "${commit_msg}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        err_trimmed=$(printf '%s' "${error_msg}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         local escaped_msg
-        escaped_msg=$(echo "$commit_msg" | jq -Rs . 2>/dev/null || echo "\"$commit_msg\"")
+        escaped_msg=$(printf '%s' "$msg_trimmed" | jq -Rs . 2>/dev/null || echo "\"${msg_trimmed}\"")
         local escaped_error
-        escaped_error=$(echo "$error_msg" | jq -Rs . 2>/dev/null || echo "\"$error_msg\"")
+        if [ -n "$err_trimmed" ]; then
+            escaped_error=$(printf '%s' "$err_trimmed" | jq -Rs . 2>/dev/null || echo "\"${err_trimmed}\"")
+        else
+            escaped_error='""'
+        fi
 
         jq -n \
             --arg status "$status" \
@@ -631,12 +670,15 @@ process_terminal_state() {
     local commit_sha commit_msg
 
     if command -v jq &>/dev/null; then
-        deploy_state=$(echo "$detail" | jq -r '.state // "UNKNOWN"' 2>/dev/null)
+        # v12 API: 优先使用 readyState，降级到 status，再降级到 state
+        deploy_state=$(echo "$detail" | jq -r '.readyState // .status // .state // "UNKNOWN"' 2>/dev/null)
         project_name=$(echo "$detail" | jq -r '.name // empty' 2>/dev/null)
         deploy_url=$(echo "$detail" | jq -r '.url // .alias[0] // empty' 2>/dev/null)
         inspector_url=$(echo "$detail" | jq -r '.inspectorUrl // empty' 2>/dev/null)
+        # createdAt 可能是毫秒 epoch (v12) 或 ISO 8601 字符串 (v9)
         created_at=$(echo "$detail" | jq -r '.createdAt // empty' 2>/dev/null)
-        ready_at=$(echo "$detail" | jq -r '.ready // empty' 2>/dev/null)
+        # ready 是毫秒 epoch；v9 用 readyAt，v12 用 ready (number)
+        ready_at=$(echo "$detail" | jq -r '.ready // .readyAt // empty' 2>/dev/null)
         commit_sha=$(echo "$detail" | jq -r '.meta.githubCommitSha // .meta.gitlabCommitSha // empty' 2>/dev/null)
         commit_msg=$(echo "$detail" | jq -r '.meta.githubCommitMessage // .meta.gitlabCommitMessage // empty' 2>/dev/null)
     else
@@ -666,6 +708,11 @@ process_terminal_state() {
         log_error "部署错误: $error_msg"
     fi
 
+    # 将毫秒 epoch 时间戳转换为可读格式（用于显示和 JSON 输出）
+    local created_iso ready_iso
+    created_iso=$(epoch_to_iso "$created_at")
+    ready_iso=$(epoch_to_iso "$ready_at")
+
     # 显示摘要
     echo "" >&2
     log_separator >&2
@@ -677,6 +724,8 @@ process_terminal_state() {
     [ -n "$commit_sha" ] && log_info "  Commit:      ${commit_sha:0:7}" >&2
     [ -n "$commit_msg" ] && log_info "  提交信息:   $commit_msg" >&2
     log_info "  构建耗时:   ${build_seconds}s" >&2
+    [ -n "$created_iso" ] && log_info "  创建时间:   $created_iso" >&2
+    [ -n "$ready_iso" ] && log_info "  就绪时间:   $ready_iso" >&2
     [ -n "$error_msg" ] && log_error "  错误信息:   $error_msg" >&2
     log_separator >&2
     echo "" >&2
@@ -699,8 +748,8 @@ process_terminal_state() {
         "${commit_sha:-}" \
         "${commit_msg:-}" \
         "${build_seconds:-0}" \
-        "${created_at:-}" \
-        "${ready_at:-}" \
+        "${created_iso:-}" \
+        "${ready_iso:-}" \
         "${error_msg}"
 }
 
