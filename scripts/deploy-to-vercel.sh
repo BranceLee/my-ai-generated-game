@@ -72,6 +72,9 @@
 #
 # =============================================================================
 
+# 全局标志位：git push 是否成功（影响后续 Vercel 步骤是否执行）
+PUSH_OK=false
+
 set -euo pipefail  # 严格模式：任何错误立即退出，未定义变量报错，管道错误传递
 
 # ---------------------------------------------------------------------------
@@ -196,10 +199,10 @@ preflight_check() {
     # --- 派生变量 ---
     if [ -n "${GITHUB_TOKEN:-}" ]; then
         # 通过 API 获取当前 GitHub 用户名
-        local gh_user
-        gh_user=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" \
-            https://api.github.com/user 2>/dev/null | json_get - login)
-        GITHUB_OWNER="${GITHUB_ORG:-$gh_user}"
+        local gh_user_json
+        gh_user_json=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" \
+            https://api.github.com/user 2>/dev/null || echo "")
+        GITHUB_OWNER="${GITHUB_ORG:-$(json_get "$gh_user_json" "login")}"
     else
         # 使用 gh CLI
         GITHUB_OWNER="${GITHUB_ORG:-$(gh api user --jq .login 2>/dev/null)}"
@@ -326,7 +329,7 @@ EOF
             -H "Content-Type: application/json" \
             -H "Accept: application/vnd.github.v3+json" \
             -d "$create_payload" \
-            "https://api.github.com/user/repos" 2>&1)
+            "https://api.github.com/user/repos" 2>/dev/null)
 
         local created_name
         created_name=$(json_get "$create_resp" "full_name")
@@ -395,14 +398,14 @@ setup_git_remote() {
         current_branch="main"
     fi
 
-    if git push -u origin "$current_branch" 2>&1; then
+    if git push -u origin "$current_branch" 2>/dev/null; then
+        PUSH_OK=true
         log_success "代码推送成功 → ${GITHUB_OWNER}/${GITHUB_REPO_NAME} (branch: $current_branch)"
     else
-        log_warn "推送失败，可能是远端已有内容。尝试 force push...注意：这只应在新项目上使用！"
-        log_warn "如果你确定要继续（仅限新项目），取消注释下面的命令"
+        log_warn "推送失败，可能是远端已有内容。Vercel 绑定需要代码已推送到 GitHub。"
+        log_warn "如果你确定要继续（仅限新项目且确认代码已在远端），取消注释下面命令后重新运行"
         # git push -u origin "$current_branch" --force
-        log_error "推送失败，请手动处理 git push"
-        # 不 exit，因为可能远端已有内容，用户已自行处理
+        log_error "跳过后续 Vercel 绑定步骤——代码未推送，Vercel 无法拉取仓库内容"
     fi
 
     echo ""
@@ -429,10 +432,11 @@ check_vercel_project() {
     projects_resp=$(curl -sS -H "$VERCEL_AUTH_HEADER" "$list_url" 2>/dev/null || echo "[]")
 
     # 在返回的项目列表中查找匹配名称的项目 ID
+    # Vercel GET /v9/projects 返回格式: {"projects": [...]}
     local project_id
     if command -v jq &>/dev/null; then
         project_id=$(echo "$projects_resp" | \
-            jq -r ".[] | select(.name == \"${GITHUB_REPO_NAME}\") | .id // empty" 2>/dev/null | head -1)
+            jq -r ".projects[]? | select(.name == \"${GITHUB_REPO_NAME}\") | .id // empty" 2>/dev/null | head -1)
     else
         # 降级：用 grep 提取匹配项目名的 id
         project_id=$(echo "$projects_resp" | \
@@ -466,12 +470,12 @@ create_and_bind_vercel_project() {
     fi
     log_info "框架预设: $framework"
 
-    # --- 构建目录与输出目录检测 ---
-    local build_dir
+    # --- 构建命令与输出目录检测 ---
+    local build_cmd
     local output_dir
-    build_dir=$(detect_build_dir)
+    build_cmd=$(detect_build_command)
     output_dir=$(detect_output_dir)
-    log_info "构建目录: ${build_dir:-未检测到}"
+    log_info "构建命令: ${build_cmd:-默认}"
     log_info "输出目录: ${output_dir:-未检测到}"
 
     # --- 安装命令检测 ---
@@ -485,8 +489,10 @@ create_and_bind_vercel_project() {
 
     # 构造 JSON 请求体
     # Vercel 创建项目时可以直接绑定 git 仓库
+    # 注意：framework 为空时让 Vercel 自动检测
     local payload
-    payload=$(cat <<EOF
+    if [ -n "$framework" ]; then
+        payload=$(cat <<EOF
 {
   "name": "${GITHUB_REPO_NAME}",
   "framework": "${framework}",
@@ -496,13 +502,25 @@ create_and_bind_vercel_project() {
   }
 }
 EOF
-    )
+        )
+    else
+        payload=$(cat <<EOF
+{
+  "name": "${GITHUB_REPO_NAME}",
+  "gitRepository": {
+    "type": "github",
+    "repo": "${GITHUB_OWNER}/${GITHUB_REPO_NAME}"
+  }
+}
+EOF
+        )
+    fi
 
     # 添加可选字段（仅在检测到值时）
     # 注意：这里用 jq 合并，如果没有 jq 则跳过可选字段
     if command -v jq &>/dev/null; then
         local extra_fields="{}"
-        [ -n "$build_dir" ] && extra_fields=$(echo "$extra_fields" | jq ".buildCommand = \"$build_dir\"")
+        [ -n "$build_cmd" ] && extra_fields=$(echo "$extra_fields" | jq ".buildCommand = \"$build_cmd\"")
         [ -n "$output_dir" ] && extra_fields=$(echo "$extra_fields" | jq ".outputDirectory = \"$output_dir\"")
         [ -n "$install_cmd" ] && extra_fields=$(echo "$extra_fields" | jq ".installCommand = \"$install_cmd\"")
         payload=$(echo "$payload" | jq ". + $extra_fields")
@@ -514,7 +532,7 @@ EOF
         -H "$VERCEL_AUTH_HEADER" \
         -H "Content-Type: application/json" \
         -d "$payload" \
-        "$create_url" 2>&1)
+        "$create_url" 2>/dev/null)
 
     # 检查响应
     local created_name
@@ -576,6 +594,7 @@ update_git_binding_if_needed() {
 
     local linked_repo
     if command -v jq &>/dev/null; then
+        # Vercel API 在不同阶段返回不同格式：可能是 "owner/repo" 或仅 "repo"
         linked_repo=$(echo "$detail_resp" | jq -r '.link.repo // .gitRepository.repo // empty' 2>/dev/null || true)
     else
         linked_repo=$(json_get "$detail_resp" "repo" 2>/dev/null || true)
@@ -583,8 +602,13 @@ update_git_binding_if_needed() {
 
     if [ -n "$linked_repo" ]; then
         log_success "Vercel 项目已绑定 Git 仓库: $linked_repo"
+        # 匹配：完整 owner/repo 或仅 repo 名
         if echo "$linked_repo" | grep -q "${GITHUB_OWNER}/${GITHUB_REPO_NAME}"; then
             log_success "绑定仓库与目标一致，无需更新 ✓"
+            return 0
+        elif [ "$linked_repo" = "$GITHUB_REPO_NAME" ]; then
+            # Vercel 在 GitHub App 授权前可能只返回 repo 名不带 owner
+            log_success "绑定仓库与目标一致 (repo name match)，无需更新 ✓"
             return 0
         else
             log_warn "绑定仓库与目标不一致: $linked_repo != ${GITHUB_OWNER}/${GITHUB_REPO_NAME}"
@@ -613,7 +637,7 @@ EOF
         -H "$VERCEL_AUTH_HEADER" \
         -H "Content-Type: application/json" \
         -d "$update_payload" \
-        "$update_url" 2>&1)
+        "$update_url" 2>/dev/null)
 
     local updated_repo
     if command -v jq &>/dev/null; then
@@ -714,31 +738,39 @@ detect_framework() {
         elif grep -q '"react"' package.json 2>/dev/null; then
             echo "create-react-app"
         else
-            echo "other"
+            echo ""
         fi
     elif [ -f "index.html" ]; then
-        echo "static"
+        # Vercel 不支持 "static" 框架名，返回空让其自动检测
+        echo ""
     else
-        echo "other"
+        echo ""
     fi
 }
 
 # ---------------------------------------------------------------------------
 # 辅助：检测构建命令
 # ---------------------------------------------------------------------------
-detect_build_dir() {
+detect_build_command() {
     cd "$PROJECT_DIR"
 
-    if [ -f "package.json" ]; then
-        if grep -q '"build"' package.json 2>/dev/null; then
-            # 返回空让 Vercel 自动检测
-            echo ""
-        elif grep -q '"react-scripts"' package.json 2>/dev/null; then
-            echo ""
+    # 检查 package.json 中是否定义了 "build" script
+    if [ -f "package.json" ] && grep -q '"build"' package.json 2>/dev/null; then
+        # 根据包管理器返回对应的 build 命令
+        if [ -f "pnpm-lock.yaml" ]; then
+            echo "pnpm build"
+        elif [ -f "yarn.lock" ]; then
+            echo "yarn build"
+        elif [ -f "bun.lockb" ]; then
+            echo "bun run build"
+        elif [ -f "package-lock.json" ]; then
+            echo "npm run build"
         else
+            # 有 package.json 但无法确定包管理器，让 Vercel 自动检测
             echo ""
         fi
     else
+        # 没有 package.json 或没有 build script，让 Vercel 自动检测
         echo ""
     fi
 }
@@ -751,7 +783,7 @@ detect_output_dir() {
 
     if [ -f "next.config.js" ] || [ -f "next.config.ts" ]; then
         echo ".next"
-    elif [ -f "nuxt.config.js" ]; then
+    elif [ -f "nuxt.config.js" ] || [ -f "nuxt.config.ts" ]; then
         echo ".output"
     elif grep -q '"react-scripts"' package.json 2>/dev/null; then
         echo "build"
@@ -818,19 +850,26 @@ main() {
     # Step 2: 配置 git remote 并推送
     setup_git_remote
 
-    # Step 3: 检查 Vercel 项目是否已绑定
-    if check_vercel_project; then
-        # 项目已存在，检查 git 绑定是否需要更新
-        update_git_binding_if_needed
-    else
-        # Step 4: 创建 Vercel 项目并绑定 GitHub
-        create_and_bind_vercel_project
-        # Step 4b: 确认绑定状态
-        update_git_binding_if_needed
-    fi
+    # 仅当 git push 成功时才继续 Vercel 相关步骤
+    # Vercel 需要从 GitHub 拉取代码，push 失败则后续步骤无意义
+    if $PUSH_OK; then
+        # Step 3: 检查 Vercel 项目是否已绑定
+        if check_vercel_project; then
+            # 项目已存在，检查 git 绑定是否需要更新
+            update_git_binding_if_needed
+        else
+            # Step 4: 创建 Vercel 项目并绑定 GitHub
+            create_and_bind_vercel_project
+            # Step 4b: 确认绑定状态
+            update_git_binding_if_needed
+        fi
 
-    # Step 5: 触发部署
-    trigger_deploy
+        # Step 5: 触发部署
+        trigger_deploy
+    else
+        log_warn "Vercel 步骤已跳过。请先手动推送代码，然后运行:"
+        log_warn "  vercel --cwd $PROJECT_DIR"
+    fi
 
     # Step 6: 打印摘要
     print_summary
