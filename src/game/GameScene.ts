@@ -39,11 +39,24 @@ export class GameScene extends Phaser.Scene {
   private nextText!: Phaser.GameObjects.Text;
   private gameOverText!: Phaser.GameObjects.Text;
   private restartText!: Phaser.GameObjects.Text;
+  private mobileHintText!: Phaser.GameObjects.Text;
 
   // 键盘输入
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private spaceKey!: Phaser.Input.Keyboard.Key;
   private rKey!: Phaser.Input.Keyboard.Key;
+
+  // 触摸输入状态
+  private touchStartX = 0;
+  private touchStartY = 0;
+  private touchActive = false;
+  private touchMoved = false;
+  private touchMovedX = 0;
+  private touchMovedY = 0;
+  private lastHorizontalSwipeX = 0;
+  private softDropHeld = false;
+  private isTouchDevice = false;
+  private touchActionListener: ((e: Event) => void) | null = null;
 
   constructor() {
     super({ key: 'GameScene' });
@@ -52,6 +65,10 @@ export class GameScene extends Phaser.Scene {
   create(): void {
     this.initBoard();
     this.graphics = this.add.graphics();
+
+    // 检测触摸设备
+    this.isTouchDevice =
+      'ontouchstart' in window || navigator.maxTouchPoints > 0;
 
     // ---- UI 文本 ----
     const labelStyle: Phaser.Types.GameObjects.Text.TextStyle = {
@@ -86,7 +103,12 @@ export class GameScene extends Phaser.Scene {
         BOARD_X + (COLS * CELL_SIZE) / 2,
         BOARD_Y + (ROWS * CELL_SIZE) / 2 - 20,
         'GAME OVER',
-        { fontFamily: 'monospace', fontSize: '36px', color: '#ff4444', fontStyle: 'bold' },
+        {
+          fontFamily: 'monospace',
+          fontSize: '36px',
+          color: '#ff4444',
+          fontStyle: 'bold',
+        },
       )
       .setOrigin(0.5)
       .setDepth(10)
@@ -96,8 +118,12 @@ export class GameScene extends Phaser.Scene {
       .text(
         BOARD_X + (COLS * CELL_SIZE) / 2,
         BOARD_Y + (ROWS * CELL_SIZE) / 2 + 25,
-        'Press R to Restart',
-        { fontFamily: 'monospace', fontSize: '16px', color: '#cccccc' },
+        'Tap or Press R to Restart',
+        {
+          fontFamily: 'monospace',
+          fontSize: '16px',
+          color: '#cccccc',
+        },
       )
       .setOrigin(0.5)
       .setDepth(10)
@@ -109,17 +135,55 @@ export class GameScene extends Phaser.Scene {
     mask.fillRect(BOARD_X, BOARD_Y, COLS * CELL_SIZE, ROWS * CELL_SIZE);
     mask.setDepth(5);
     mask.setVisible(false);
-    this.gameOverText.setData('mask', mask); // 稍后与 game over 一起控制
+    this.gameOverText.setData('mask', mask);
 
-    // ---- 输入 ----
+    // 移动端操作提示 (仅触摸设备显示)
+    if (this.isTouchDevice) {
+      this.mobileHintText = this.add
+        .text(
+          BOARD_X + (COLS * CELL_SIZE) / 2,
+          BOARD_Y + ROWS * CELL_SIZE + 50,
+          'Swipe ←→ · Tap to Rotate · Swipe ↓ Drop',
+          {
+            fontFamily: 'monospace',
+            fontSize: '11px',
+            color: '#555577',
+          },
+        )
+        .setOrigin(0.5);
+    }
+
+    // ---- 键盘输入 ----
     if (this.input.keyboard) {
       this.cursors = this.input.keyboard.createCursorKeys();
-      this.spaceKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
-      this.rKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.R);
+      this.spaceKey = this.input.keyboard.addKey(
+        Phaser.Input.Keyboard.KeyCodes.SPACE,
+      );
+      this.rKey = this.input.keyboard.addKey(
+        Phaser.Input.Keyboard.KeyCodes.R,
+      );
     }
+
+    // ---- 触摸输入 ----
+    this.input.on('pointerdown', this.onPointerDown, this);
+    this.input.on('pointermove', this.onPointerMove, this);
+    this.input.on('pointerup', this.onPointerUp, this);
+
+    // ---- 监听外部 Action (HTML 按钮等) ----
+    this.touchActionListener = ((e: CustomEvent) => {
+      this.handleExternalAction(e.detail);
+    }) as EventListener;
+    document.addEventListener('tetris-action', this.touchActionListener);
 
     // 开始游戏
     this.spawnPiece();
+  }
+
+  // 场景销毁时清理
+  shutdown(): void {
+    if (this.touchActionListener) {
+      document.removeEventListener('tetris-action', this.touchActionListener);
+    }
   }
 
   update(_time: number, delta: number): void {
@@ -133,10 +197,13 @@ export class GameScene extends Phaser.Scene {
 
     if (!this.currentPiece) return;
 
-    this.handleInput();
+    this.handleKeyboardInput();
 
-    // 自动下落 (按住 ↓ 加速)
-    const interval = this.cursors.down?.isDown ? 50 : getDropInterval(this.level);
+    // 自动下落 (按住 ↓ 或触摸软降时加速)
+    const interval =
+      this.cursors.down?.isDown || this.softDropHeld
+        ? 50
+        : getDropInterval(this.level);
     this.dropTimer += delta;
 
     if (this.dropTimer >= interval) {
@@ -147,7 +214,7 @@ export class GameScene extends Phaser.Scene {
         if (!this.spawnPiece()) {
           this.endGame();
         }
-      } else if (this.cursors.down?.isDown) {
+      } else if (this.cursors.down?.isDown || this.softDropHeld) {
         // 软降奖励
         this.score += 1;
         this.updateUI();
@@ -161,7 +228,7 @@ export class GameScene extends Phaser.Scene {
   //         输入处理
   // ========================
 
-  private handleInput(): void {
+  private handleKeyboardInput(): void {
     if (!this.currentPiece || !this.input.keyboard) return;
 
     if (Phaser.Input.Keyboard.JustDown(this.cursors.left)) {
@@ -176,6 +243,107 @@ export class GameScene extends Phaser.Scene {
     if (Phaser.Input.Keyboard.JustDown(this.spaceKey)) {
       this.hardDrop();
     }
+  }
+
+  /** 来自外部 (HTML按钮) 的操作 */
+  private handleExternalAction(action: string): void {
+    if (this.gameOver) {
+      if (action === 'restart') this.restart();
+      return;
+    }
+    switch (action) {
+      case 'left':
+        this.movePiece(-1, 0);
+        break;
+      case 'right':
+        this.movePiece(1, 0);
+        break;
+      case 'rotate':
+        this.rotatePiece();
+        break;
+      case 'hardDrop':
+        this.hardDrop();
+        break;
+      case 'softDropStart':
+        this.softDropHeld = true;
+        break;
+      case 'softDropEnd':
+        this.softDropHeld = false;
+        break;
+    }
+  }
+
+  // ---- 触摸手势 ----
+
+  private onPointerDown(pointer: Phaser.Input.Pointer): void {
+    if (this.gameOver) {
+      this.restart();
+      return;
+    }
+    this.touchActive = true;
+    this.touchMoved = false;
+    this.touchStartX = pointer.x;
+    this.touchStartY = pointer.y;
+    this.lastHorizontalSwipeX = pointer.x;
+    this.touchMovedX = 0;
+    this.touchMovedY = 0;
+  }
+
+  private onPointerMove(pointer: Phaser.Input.Pointer): void {
+    if (!this.touchActive || !this.currentPiece) return;
+
+    const dx = pointer.x - this.touchStartX;
+    const dy = pointer.y - this.touchStartY;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    this.touchMovedX = dx;
+    this.touchMovedY = dy;
+
+    // 水平滑动 — 移动方块 (滑动足够距离后触发)
+    const hSwipeDx = pointer.x - this.lastHorizontalSwipeX;
+    if (Math.abs(hSwipeDx) >= CELL_SIZE * 0.6) {
+      this.touchMoved = true;
+      if (hSwipeDx > 0) {
+        this.movePiece(1, 0);
+      } else {
+        this.movePiece(-1, 0);
+      }
+      this.lastHorizontalSwipeX = pointer.x;
+    }
+
+    // 向下滑动超过阈值 → 激活软降
+    if (dy > CELL_SIZE && absDy > absDx) {
+      this.touchMoved = true;
+      this.softDropHeld = true;
+    }
+  }
+
+  private onPointerUp(_pointer: Phaser.Input.Pointer): void {
+    this.softDropHeld = false;
+
+    if (!this.touchActive || !this.currentPiece) {
+      this.touchActive = false;
+      return;
+    }
+
+    const absDx = Math.abs(this.touchMovedX);
+    const absDy = Math.abs(this.touchMovedY);
+
+    // 无显著移动 → 点击 = 旋转
+    if (!this.touchMoved && absDx < CELL_SIZE * 0.5 && absDy < CELL_SIZE * 0.5) {
+      this.rotatePiece();
+    }
+
+    // 向下快速滑动 → 硬降
+    if (this.touchMoved && this.touchMovedY > CELL_SIZE * 2 && absDy > absDx) {
+      this.hardDrop();
+    }
+
+    this.touchActive = false;
+    this.touchMoved = false;
+    this.touchMovedX = 0;
+    this.touchMovedY = 0;
   }
 
   // ========================
@@ -205,14 +373,18 @@ export class GameScene extends Phaser.Scene {
   }
 
   /** 碰撞检测 */
-  private checkCollision(matrix: number[][], px: number, py: number): boolean {
+  private checkCollision(
+    matrix: number[][],
+    px: number,
+    py: number,
+  ): boolean {
     for (let r = 0; r < matrix.length; r++) {
       for (let c = 0; c < matrix[r].length; c++) {
         if (!matrix[r][c]) continue;
         const bx = px + c;
         const by = py + r;
         if (bx < 0 || bx >= COLS || by >= ROWS) return true;
-        if (by < 0) continue; // 允许在棋盘上方
+        if (by < 0) continue;
         if (this.board[by][bx] !== 0) return true;
       }
     }
@@ -241,22 +413,23 @@ export class GameScene extends Phaser.Scene {
     if (!this.currentPiece) return;
     const { matrix, type } = this.currentPiece;
 
-    // O 方块不旋转
     if (type === 'O') return;
 
-    // 顺时针旋转 90°: 转置 + 水平翻转每一行
     const size = matrix.length;
-    const rotated: number[][] = Array.from({ length: size }, () => Array(size).fill(0));
+    const rotated: number[][] = Array.from({ length: size }, () =>
+      Array(size).fill(0),
+    );
     for (let r = 0; r < size; r++) {
       for (let c = 0; c < size; c++) {
         rotated[c][size - 1 - r] = matrix[r][c];
       }
     }
 
-    // 尝试墙踢位移
     const kicks = [0, -1, 1, -2, 2];
     for (const dx of kicks) {
-      if (!this.checkCollision(rotated, this.currentPiece.x + dx, this.currentPiece.y)) {
+      if (
+        !this.checkCollision(rotated, this.currentPiece.x + dx, this.currentPiece.y)
+      ) {
         this.currentPiece.matrix = rotated;
         this.currentPiece.x += dx;
         return;
@@ -264,17 +437,19 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  /** 获取幽灵方块 (预览落点) 的 Y 坐标 */
+  /** 获取幽灵方块 Y 坐标 */
   private getGhostY(): number {
     if (!this.currentPiece) return 0;
     let gy = this.currentPiece.y;
-    while (!this.checkCollision(this.currentPiece.matrix, this.currentPiece.x, gy + 1)) {
+    while (
+      !this.checkCollision(this.currentPiece.matrix, this.currentPiece.x, gy + 1)
+    ) {
       gy++;
     }
     return gy;
   }
 
-  /** 硬降 (直接落底) */
+  /** 硬降 */
   private hardDrop(): void {
     if (!this.currentPiece) return;
     const ghostY = this.getGhostY();
@@ -288,7 +463,7 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  /** 将方块锁定到棋盘 */
+  /** 锁定方块到棋盘 */
   private lockPiece(): void {
     if (!this.currentPiece) return;
     const { matrix, x, y, type } = this.currentPiece;
@@ -315,7 +490,7 @@ export class GameScene extends Phaser.Scene {
         this.board.splice(r, 1);
         this.board.unshift(Array(COLS).fill(0));
         cleared++;
-        r++; // 重新检查当前行
+        r++;
       }
     }
 
@@ -333,6 +508,7 @@ export class GameScene extends Phaser.Scene {
 
   private endGame(): void {
     this.gameOver = true;
+    this.softDropHeld = false;
     this.gameOverText.setVisible(true);
     this.restartText.setVisible(true);
     this.gameOverText.getData('mask')?.setVisible(true);
@@ -347,6 +523,7 @@ export class GameScene extends Phaser.Scene {
     this.dropTimer = 0;
     this.currentPiece = null;
     this.nextType = '';
+    this.softDropHeld = false;
 
     this.gameOverText.setVisible(false);
     this.restartText.setVisible(false);
@@ -365,7 +542,12 @@ export class GameScene extends Phaser.Scene {
 
     // ---- 棋盘背景 ----
     this.graphics.fillStyle(0x0a0a1a);
-    this.graphics.fillRect(BOARD_X, BOARD_Y, COLS * CELL_SIZE, ROWS * CELL_SIZE);
+    this.graphics.fillRect(
+      BOARD_X,
+      BOARD_Y,
+      COLS * CELL_SIZE,
+      ROWS * CELL_SIZE,
+    );
 
     // ---- 网格线 ----
     this.graphics.lineStyle(1, 0x1a1a3a, 0.3);
@@ -425,7 +607,7 @@ export class GameScene extends Phaser.Scene {
       const previewY = BOARD_Y + 220;
       const pm = TETROMINOES[this.nextType];
       const pc = COLORS[this.nextType];
-      const ps = 20; // 预览格大小
+      const ps = 20;
 
       for (let r = 0; r < pm.length; r++) {
         for (let c = 0; c < pm[r].length; c++) {
@@ -447,25 +629,32 @@ export class GameScene extends Phaser.Scene {
 
     // ---- 棋盘边框 ----
     this.graphics.lineStyle(2, 0x4444aa);
-    this.graphics.strokeRect(BOARD_X, BOARD_Y, COLS * CELL_SIZE, ROWS * CELL_SIZE);
+    this.graphics.strokeRect(
+      BOARD_X,
+      BOARD_Y,
+      COLS * CELL_SIZE,
+      ROWS * CELL_SIZE,
+    );
   }
 
-  /** 绘制单个单元格 (带立体高光/阴影效果) */
-  private drawCell(col: number, row: number, color: number, alpha = 1): void {
+  /** 绘制单个单元格 (立体高光/阴影) */
+  private drawCell(
+    col: number,
+    row: number,
+    color: number,
+    alpha = 1,
+  ): void {
     const x = BOARD_X + col * CELL_SIZE;
     const y = BOARD_Y + row * CELL_SIZE;
     const s = CELL_SIZE;
 
-    // 主体
     this.graphics.fillStyle(color, alpha);
     this.graphics.fillRect(x + 1, y + 1, s - 2, s - 2);
 
-    // 高光 (上边 + 左边)
     this.graphics.fillStyle(0xffffff, alpha * 0.25);
     this.graphics.fillRect(x + 1, y + 1, s - 2, 3);
     this.graphics.fillRect(x + 1, y + 1, 3, s - 2);
 
-    // 阴影 (下边 + 右边)
     this.graphics.fillStyle(0x000000, alpha * 0.25);
     this.graphics.fillRect(x + 1, y + s - 4, s - 2, 3);
     this.graphics.fillRect(x + s - 4, y + 1, 3, s - 2);
