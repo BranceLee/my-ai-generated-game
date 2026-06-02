@@ -29,6 +29,7 @@ export class GameScene extends Phaser.Scene {
   private level = 1;
   private lines = 0;
   private gameOver = false;
+  private paused = false;
   private dropTimer = 0;
 
   // Phaser 对象
@@ -39,12 +40,17 @@ export class GameScene extends Phaser.Scene {
   private nextText!: Phaser.GameObjects.Text;
   private gameOverText!: Phaser.GameObjects.Text;
   private restartText!: Phaser.GameObjects.Text;
+  private pauseOverlay!: Phaser.GameObjects.Graphics;
+  private pauseText!: Phaser.GameObjects.Text;
+  private pauseHintText!: Phaser.GameObjects.Text;
   private mobileHintText!: Phaser.GameObjects.Text;
 
   // 键盘输入
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private spaceKey!: Phaser.Input.Keyboard.Key;
   private rKey!: Phaser.Input.Keyboard.Key;
+  private pKey!: Phaser.Input.Keyboard.Key;
+  private escKey!: Phaser.Input.Keyboard.Key;
 
   // 触摸输入状态
   private touchStartX = 0;
@@ -137,6 +143,42 @@ export class GameScene extends Phaser.Scene {
     mask.setVisible(false);
     this.gameOverText.setData('mask', mask);
 
+    // ---- 暂停遮罩 ----
+    this.pauseOverlay = this.add.graphics();
+    this.pauseOverlay.setDepth(8);
+    this.pauseOverlay.setVisible(false);
+
+    this.pauseText = this.add
+      .text(
+        BOARD_X + (COLS * CELL_SIZE) / 2,
+        BOARD_Y + (ROWS * CELL_SIZE) / 2 - 15,
+        'PAUSED',
+        {
+          fontFamily: 'monospace',
+          fontSize: '36px',
+          color: '#ffffff',
+          fontStyle: 'bold',
+        },
+      )
+      .setOrigin(0.5)
+      .setDepth(9)
+      .setVisible(false);
+
+    this.pauseHintText = this.add
+      .text(
+        BOARD_X + (COLS * CELL_SIZE) / 2,
+        BOARD_Y + (ROWS * CELL_SIZE) / 2 + 25,
+        'Press P or Esc to Resume',
+        {
+          fontFamily: 'monospace',
+          fontSize: '16px',
+          color: '#aaaacc',
+        },
+      )
+      .setOrigin(0.5)
+      .setDepth(9)
+      .setVisible(false);
+
     // 移动端操作提示 (仅触摸设备显示)
     if (this.isTouchDevice) {
       this.mobileHintText = this.add
@@ -161,6 +203,12 @@ export class GameScene extends Phaser.Scene {
       );
       this.rKey = this.input.keyboard.addKey(
         Phaser.Input.Keyboard.KeyCodes.R,
+      );
+      this.pKey = this.input.keyboard.addKey(
+        Phaser.Input.Keyboard.KeyCodes.P,
+      );
+      this.escKey = this.input.keyboard.addKey(
+        Phaser.Input.Keyboard.KeyCodes.ESC,
       );
     }
 
@@ -187,6 +235,21 @@ export class GameScene extends Phaser.Scene {
   }
 
   update(_time: number, delta: number): void {
+    // 检查暂停键盘输入（需要在所有状态下都能响应）
+    if (this.input.keyboard) {
+      if (
+        Phaser.Input.Keyboard.JustDown(this.pKey) ||
+        Phaser.Input.Keyboard.JustDown(this.escKey)
+      ) {
+        this.togglePause();
+      }
+    }
+
+    if (this.paused) {
+      this.render();
+      return;
+    }
+
     if (this.gameOver) {
       if (Phaser.Input.Keyboard.JustDown(this.rKey)) {
         this.restart();
@@ -269,6 +332,9 @@ export class GameScene extends Phaser.Scene {
         break;
       case 'softDropEnd':
         this.softDropHeld = false;
+        break;
+      case 'togglePause':
+        this.togglePause();
         break;
     }
   }
@@ -506,9 +572,40 @@ export class GameScene extends Phaser.Scene {
   //        游戏流程
   // ========================
 
+  private togglePause(): void {
+    if (this.gameOver) return;
+
+    this.paused = !this.paused;
+
+    if (this.paused) {
+      // 绘制暂停遮罩
+      this.pauseOverlay.clear();
+      this.pauseOverlay.fillStyle(0x000000, 0.6);
+      this.pauseOverlay.fillRect(
+        BOARD_X,
+        BOARD_Y,
+        COLS * CELL_SIZE,
+        ROWS * CELL_SIZE,
+      );
+      this.pauseOverlay.setVisible(true);
+      this.pauseText.setVisible(true);
+      this.pauseHintText.setVisible(true);
+    } else {
+      this.pauseOverlay.setVisible(false);
+      this.pauseText.setVisible(false);
+      this.pauseHintText.setVisible(false);
+      // 重置下落计时器防止恢复时方块立刻下落
+      this.dropTimer = 0;
+    }
+  }
+
   private endGame(): void {
     this.gameOver = true;
+    this.paused = false;
     this.softDropHeld = false;
+    this.pauseOverlay.setVisible(false);
+    this.pauseText.setVisible(false);
+    this.pauseHintText.setVisible(false);
     this.gameOverText.setVisible(true);
     this.restartText.setVisible(true);
     this.gameOverText.getData('mask')?.setVisible(true);
@@ -520,6 +617,7 @@ export class GameScene extends Phaser.Scene {
     this.level = 1;
     this.lines = 0;
     this.gameOver = false;
+    this.paused = false;
     this.dropTimer = 0;
     this.currentPiece = null;
     this.nextType = '';

@@ -109,6 +109,20 @@ function App() {
               ⏬
             </button>
           </div>
+
+          {/* 控制按钮行 */}
+          <div className="controls-row">
+            <button
+              className="ctrl-btn ctrl-pause"
+              onTouchStart={(e) => {
+                e.preventDefault();
+                dispatchAction('togglePause');
+              }}
+              aria-label="Pause"
+            >
+              ⏸
+            </button>
+          </div>
         </div>
       )}
     </div>

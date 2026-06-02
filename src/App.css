@@ -91,6 +91,12 @@ html, body, #root {
   padding: 8px;
 }
 
+.ctrl-pause {
+  flex: 0 0 auto;
+  padding: 8px 24px;
+  font-size: 22px;
+}
+
 /* 桌面端：隐藏移动端控件 */
 @media (hover: hover) and (pointer: fine) {
   .mobile-controls {
